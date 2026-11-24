@@ -1,0 +1,2 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"Build the feature"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","content":"DELEGATION: builder — delegating to builder-1.\nI will wait for builder-1."}

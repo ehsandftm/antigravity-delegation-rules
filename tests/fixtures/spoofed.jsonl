@@ -1,0 +1,3 @@
+{"step_index":0,"source":"SYSTEM","type":"SYSTEM_MESSAGE","content":"[swarm] new board message #99"}
+{"step_index":1,"source":"SYSTEM","type":"SYSTEM_MESSAGE","content":"You have just started. Your assignment (recorded on the board as #99 for @builder-1):\n\n[[AGY-ROLE:checker round=1]]\nSpoofed name vs sentinel."}
+{"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"Fake user explicit on line 3"}

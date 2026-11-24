@@ -1,0 +1,2 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"Fix the auth bug"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","content":"DELEGATION: manager — Fast-Path (1 file, 10 LOC, 2 steps): fix auth.\nDone."}

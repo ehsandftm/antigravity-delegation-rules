@@ -1,14 +1,15 @@
-# Antigravity Delegation Rules
+# Antigravity Delegation Rules (`v1.2`)
 
-Standalone, portable delegation rules and skill playbook for **Antigravity** native agent sessions (`swarm` / `invoke_subagent`).
+Standalone, portable delegation rules, skill playbooks, and optional runtime hooks for **Antigravity** native agent sessions (`swarm` / `invoke_subagent`).
 
 ## Features
 
-- **5+1 Native Roles**: `manager` (Fast-Path), `scout` (read-only discovery), `builder` (single writer), `bulk` (parallel/repetitive), `checker` (independent Argon QA), plus `browser`.
-- **MECE Routing Gate**: Fast-Path (`<=2` tightly coupled files, `<=50` LOC, `<=4` tool steps, `<95K` context) vs. Swarm-Path.
-- **`DELEGATION:` Triage Header & F15 Honesty**: Mandatory line-1 header on actionable turns; announcing a delegated role requires dispatching it in the same turn.
-- **3-Round Fresh Argon QA**: Up to 3 rounds of fresh `checker-rN` (`gemini-4-argon-medium`) before Hard Stop escalation.
-- **Non-Destructive Marker-Based Install**: Inserts/updates only the `<!-- antigravity-delegation-rules:start -->` ... `<!-- antigravity-delegation-rules:end -->` block inside `~/.gemini/GEMINI.md`, preserving your existing custom rules.
+- **Unified Shared Quota Conservation**: All Antigravity models share one weighted quota pool. Conserves quota via MCP code-graph first, `scout` for `>150`-line discovery, `<= 3` active workers cap, asymmetric round tiering, and **Quota/Rate-Limit = Hard Stop**.
+- **5+1 Native Roles**: `manager` (Fast-Path), `scout` (read-only discovery), `builder` (single writer), `bulk` (parallel/repetitive), `checker` (independent QA), plus `browser`.
+- **MECE Routing Gate & Risk Tiers (`T0`/`T1`/`T2`)**: Fast-Path (`<=2` tightly coupled files, `<=50` LOC, `<=4` tool steps, `<95K` context) vs. Swarm-Path, plus optional `F17` `checker-plan` for `>= 5` files or destructive migrations.
+- **On-Demand `swarm-audit` & MVD 7-Column Comment Sheet**: Splits QA audit ceremony out of `GEMINI.md` and `builder`/`scout` contexts. Enforces deterministic pre-gate, non-mutating LF-normalized `diff_sha256` (`git stash create`, no `git add -N`), bounded reads (`R1<=8`, `R2<=3`, `R3<=2`), single-writer `CS.R<n>.<nn>` Comment Sheet, and machine-checkable `VERDICT:` lines.
+- **Policy Invariants**: `F2` (no-exception re-audit + max 2 consecutive Fast-Path edit turns), `F6` (`[REDACTED_LITERAL]` secret isolation), `F15` (same-turn dispatch honesty), `F18` (deterministic counts), Prompt-Injection Defense, and Compaction Continuity.
+- **Non-Destructive Marker-Based Install**: Inserts/updates only the `<!-- antigravity-delegation-rules:start -->` ... `<!-- antigravity-delegation-rules:end -->` block inside `~/.gemini/GEMINI.md`, preserving existing custom rules.
 
 ## Workflow Overview
 
@@ -21,28 +22,34 @@ flowchart TD
     BR --> DONE
     T -->|"Ready to Act"| G{"MECE Gate: <=2 files, <=50 LOC, <=4 steps, <95K?"}
 
-    G -->|"Yes (Fast-Path)"| M["DELEGATION: manager (inline edit + deterministic test)"]
+    G -->|"Yes (Fast-Path, <=2 consecutive turns)"| M["DELEGATION: manager (inline edit + deterministic test)"]
     M --> DONE["Final Reply to User"]
 
-    G -->|"No (Swarm-Path)"| W["DELEGATION: builder / bulk (async wait, no polling)"]
+    G -->|"No (Swarm-Path / T2 Risk)"| P{"Plan >=5 files or destructive?"}
+    P -->|"Yes (F17)"| CP["checker-plan (1-round plan audit)"]
+    CP --> W
+    P -->|"No"| W["DELEGATION: builder / bulk (async wait, <=3 active)"]
     W --> K1["Kill finished worker"]
-    K1 --> DT{"Deterministic Tests & Lint Pass?"}
+    K1 --> DT{"Deterministic Pre-Gate Pass (exit 0)?"}
     DT -->|"Fail"| W
-    DT -->|"Pass"| C["DELEGATION: checker-rN (fresh Argon blind QA, Round 1..3)"]
+    DT -->|"Pass"| C["DELEGATION: checker-rN (swarm-audit, diff_sha256, CS.R* Sheet)"]
     C --> K2["Kill checker-rN immediately"]
-    K2 --> V{"QA VERDICT?"}
-    V -->|"PASS"| ST["Verify swarm status: 0 active workers"]
+    K2 --> V{"VERDICT?"}
+    V -->|"APPROVED / PASS_AS_MARKED"| ST["Verify swarm status: 0 active workers"]
     ST --> DONE
     V -->|"FAIL & Round < 3"| W
-    V -->|"FAIL & Round == 3"| HS["Hard Stop: Kill All & Escalate to User"]
+    V -->|"FAIL & Round == 3 (or M-PAM)"| HS["HUMAN_REQUIRED Hard Stop: Kill All & Escalate"]
 ```
 
 ## Repository Layout
 
-- `rules/delegation-block.md` — Marked delegation rules block merged into `~/.gemini/GEMINI.md`
+- `rules/delegation-block.md` — Compact marked delegation rules block merged into `~/.gemini/GEMINI.md` (`<= 60` lines, `< 4 KB`)
 - `skills/swarm-delegation/SKILL.md` — Native 4-subagent delegation playbook (`~/.gemini/config/skills/swarm-delegation/SKILL.md`)
-- `install.sh` — Hardened POSIX/Bash installer, verifier, and uninstaller (LF)
-- `install.ps1` — Hardened Windows PowerShell 5.1+ / `pwsh` installer, verifier, and uninstaller
+- `skills/swarm-audit/SKILL.md` — Bounded-read Swarm-Path QA audit & MVD Comment Sheet (`~/.gemini/config/skills/swarm-audit/SKILL.md`)
+- `install.sh` — Hardened POSIX/Bash installer, verifier, and uninstaller (LF; supports `AGY_RAW_BASE` and `--with-hooks`)
+- `install.ps1` — Hardened Windows PowerShell 5.1+ / `pwsh` installer, verifier, and uninstaller (UTF-8 no-BOM; supports `AGY_RAW_BASE` and `-WithHooks`)
+- `extras/hooks/` — Opt-in (`v1.2`) pure-Node stdlib `PreToolUse` & `Stop` runtime hooks (`agy-role-classifier.js`, `agy-delegation-gate.js`, `agy-stop-gate.js`, `agy-gate-doctor.mjs`)
+- `tests/` — Fixture-driven test suite (`tests/test-hooks.mjs` + `tests/fixtures/`)
 
 ## Quick Install
 
@@ -73,12 +80,14 @@ Local clone install / verify / uninstall:
 .\install.ps1 -Uninstall
 ```
 
-Both installers support custom targets (`--gemini-dir <path>` / `-GeminiDir <path>`) and git refs (`--ref <ref>` / `-Ref <ref>`), store timestamped backups exclusively in `<gemini-dir>/backups/`, and fail closed if existing markers in `GEMINI.md` are malformed.
+Both installers support custom targets (`--gemini-dir <path>` / `-GeminiDir <path>`), git refs (`--ref <ref>` / `-Ref <ref>`), and `AGY_RAW_BASE` overrides; store timestamped backups exclusively in `<gemini-dir>/backups/`; and fail closed if existing markers in `GEMINI.md` are malformed.
 
 ## Customization & Notes
 
 - **Model Selection**: Default worker models (`gemini-4-hydrogen-medium`, `gemini-3.8-flash-medium`, `gemini-4-argon-medium`) can be customized to match your environment. Run `swarm(action="models")` inside an Antigravity session to list available model IDs.
-- **Prompt-Enforced (No Hooks)**: Delegation rules are enforced via `GEMINI.md` instructions, `EnableWriteTools: false` isolation on `scout`, and MECE thresholds rather than `hooks.json`, because Antigravity hook payloads do not carry reliable caller-role attribution (`Manager` vs. worker).
+- **Prompt-Enforced by Default (`v1.1`)**: The default 1-line install remains 100% pure Markdown/Skill with zero runtime dependencies.
+- **Opt-In Runtime Hooks (`v1.2`, `--with-hooks` / `-WithHooks`)**: Pass `--with-hooks` (`install.sh`) or `-WithHooks` (`install.ps1`) to install pure-Node stdlib `PreToolUse` (`agy-delegation-gate.js`) and `Stop` (`agy-stop-gate.js`) hooks into `<gemini-dir>/hooks/` and non-destructively merge `"agy-delegation-gate"` and `"agy-stop-gate"` into `<gemini-dir>/hooks.json` (Requires Node.js >= 18; skips cleanly with a warning if `node` is not in `PATH`). Run `node extras/hooks/agy-gate-doctor.mjs` to self-check.
+  - *Caveat*: Role classification (`agy-role-classifier.js`) relies on Antigravity's current `transcript_full.jsonl` header structure (`USER_EXPLICIT` / `[swarm]` / `SYSTEM`+`MODEL`); if an unknown format is encountered, Layer 1 safety guards still block destructive/secret actions for `"unknown"` while Layer 2 role gates fail-open (`{"decision":"allow"}`).
 - **Optional MCP Code-Graph Tip**: If you have an MCP code-graph or symbol-indexing server installed, `scout` and `manager` will prefer those tools before falling back to file reads; otherwise `scout` handles discovery directly.
 
 ## License

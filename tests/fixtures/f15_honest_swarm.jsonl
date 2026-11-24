@@ -1,0 +1,3 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"Build the feature"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","content":"DELEGATION: builder — Swarm-Path: delegating to builder-1.","tool_calls":[{"name":"swarm","args":{"action":"add","name":"builder-1","brief":"[[AGY-ROLE:builder round=0]] Build it"}}]}
+{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Waiting for builder-1."}

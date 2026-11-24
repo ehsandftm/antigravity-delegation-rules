@@ -10,6 +10,33 @@ Standalone, portable delegation rules and skill playbook for **Antigravity** nat
 - **3-Round Fresh Argon QA**: Up to 3 rounds of fresh `checker-rN` (`gemini-4-argon-medium`) before Hard Stop escalation.
 - **Non-Destructive Marker-Based Install**: Inserts/updates only the `<!-- antigravity-delegation-rules:start -->` ... `<!-- antigravity-delegation-rules:end -->` block inside `~/.gemini/GEMINI.md`, preserving your existing custom rules.
 
+## Workflow Overview
+
+```mermaid
+flowchart TD
+    U["User Request"] --> T{"Need discovery >150 lines or web UI?"}
+    T -->|"Discovery / Logs"| SC["DELEGATION: scout (read-only flash)"]
+    T -->|"Live Web UI"| BR["DELEGATION: browser (flash + BROWSER_HOST_FACTS)"]
+    SC --> G
+    BR --> DONE
+    T -->|"Ready to Act"| G{"MECE Gate: <=2 files, <=50 LOC, <=4 steps, <95K?"}
+
+    G -->|"Yes (Fast-Path)"| M["DELEGATION: manager (inline edit + deterministic test)"]
+    M --> DONE["Final Reply to User"]
+
+    G -->|"No (Swarm-Path)"| W["DELEGATION: builder / bulk (async wait, no polling)"]
+    W --> K1["Kill finished worker"]
+    K1 --> DT{"Deterministic Tests & Lint Pass?"}
+    DT -->|"Fail"| W
+    DT -->|"Pass"| C["DELEGATION: checker-rN (fresh Argon blind QA, Round 1..3)"]
+    C --> K2["Kill checker-rN immediately"]
+    K2 --> V{"QA VERDICT?"}
+    V -->|"PASS"| ST["Verify swarm status: 0 active workers"]
+    ST --> DONE
+    V -->|"FAIL & Round < 3"| W
+    V -->|"FAIL & Round == 3"| HS["Hard Stop: Kill All & Escalate to User"]
+```
+
 ## Repository Layout
 
 - `rules/delegation-block.md` — Marked delegation rules block merged into `~/.gemini/GEMINI.md`

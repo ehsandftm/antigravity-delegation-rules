@@ -1,10 +1,16 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$GeminiDir = (Join-Path $HOME '.gemini'),
     [string]$Ref = 'main',
     [switch]$VerifyOnly,
     [switch]$Uninstall,
-    [switch]$WithHooks
+    [switch]$WithHooks,
+    [ValidateSet('single', 'dual')]
+    [string]$CheckerMode = '',
+    [string]$SlotAModel = '',
+    [string]$SlotBModel = '',
+    [switch]$NonInteractive,
+    [switch]$DryRun
 )
 
 Set-StrictMode -Version Latest
@@ -14,10 +20,22 @@ $StartMarker = '<!-- antigravity-delegation-rules:start -->'
 $EndMarker   = '<!-- antigravity-delegation-rules:end -->'
 $RepoSlug    = 'ehsandftm/antigravity-delegation-rules'
 $Utf8NoBom   = [System.Text.UTF8Encoding]::new($false)
+$DefaultSlotA = 'claude-opus-5-5-medium'
+$DefaultSlotB = 'gemini-4-carbon-medium'
+$ModelIdRegex = '^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
 
 function Normalize-LF {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
     return ($Text -replace "`r", '')
+}
+
+function Get-LineCountLF {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+    $norm = Normalize-LF -Text $Text
+    if ([string]::IsNullOrEmpty($norm)) { return 0 }
+    $trimmed = $norm.TrimEnd("`n")
+    if ([string]::IsNullOrEmpty($trimmed)) { return 0 }
+    return @($trimmed -split "`n").Count
 }
 
 function Get-Sha256HexLF {
@@ -30,6 +48,170 @@ function Get-Sha256HexLF {
         return ([System.BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
     } finally {
         $sha.Dispose()
+    }
+}
+
+function Assert-ValidModelId {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ModelId,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    if ([string]::IsNullOrWhiteSpace($ModelId) -or ($ModelId -notmatch $ModelIdRegex)) {
+        [Console]::Error.WriteLine("Error: Invalid model ID for ${Label}: '$ModelId'. Must match $ModelIdRegex.")
+        exit 1
+    }
+}
+
+function Get-LowModelId {
+    param([Parameter(Mandatory = $true)][string]$ModelId)
+    if ($ModelId.EndsWith('-medium', [System.StringComparison]::Ordinal)) {
+        return $ModelId.Substring(0, $ModelId.Length - 7) + '-low'
+    }
+    return $ModelId
+}
+
+function Read-ModelChoice {
+    param(
+        [Parameter(Mandatory = $true)][string]$SlotLabel,
+        [Parameter(Mandatory = $true)][int]$DefaultNum
+    )
+    $models = @(
+        'claude-opus-5-5-medium',
+        'gemini-4-carbon-medium',
+        'gemini-4-argon-medium',
+        'claude-sonnet-5-5-medium'
+    )
+    while ($true) {
+        Write-Host ""
+        Write-Host "Select model for $SlotLabel (default [$DefaultNum]):"
+        Write-Host "  1) claude-opus-5-5-medium (smaller quota; best cross-family contrast)"
+        Write-Host "  2) gemini-4-carbon-medium (larger Gemini quota pool)"
+        Write-Host "  3) gemini-4-argon-medium (Gemini quota pool)"
+        Write-Host "  4) claude-sonnet-5-5-medium (Claude quota pool)"
+        Write-Host "  5) Custom model ID"
+        $choice = Read-Host "Enter choice [1-5] (default $DefaultNum)"
+        if ([string]::IsNullOrWhiteSpace($choice)) {
+            return $models[$DefaultNum - 1]
+        }
+        $choice = $choice.Trim()
+        if ($choice -in @('1', '2', '3', '4')) {
+            return $models[[int]$choice - 1]
+        }
+        if ($choice -eq '5') {
+            $custom = Read-Host "Enter custom model ID"
+            if (-not [string]::IsNullOrWhiteSpace($custom) -and ($custom.Trim() -match $ModelIdRegex)) {
+                return $custom.Trim()
+            }
+            Write-Host "Invalid model ID. Must match $ModelIdRegex."
+            continue
+        }
+        Write-Host "Invalid selection '$choice'. Please enter 1-5."
+    }
+}
+
+function Resolve-CheckerConfigInteractive {
+    Write-Host ""
+    Write-Host "=== Antigravity Delegation Rules v1.3 Setup ==="
+    Write-Host "Step 1 — Checker Mode:"
+    Write-Host "  [1] Dual-Checker (Recommended)"
+    Write-Host "  [2] Single-Checker"
+    $modeChoice = ''
+    while ($true) {
+        $rawMode = Read-Host "Select mode [1-2] (default 1)"
+        if ([string]::IsNullOrWhiteSpace($rawMode) -or $rawMode.Trim() -eq '1') {
+            $modeChoice = 'dual'
+            break
+        }
+        if ($rawMode.Trim() -eq '2') {
+            $modeChoice = 'single'
+            break
+        }
+        Write-Host "Invalid selection '$rawMode'. Please enter 1 or 2."
+    }
+
+    Write-Host ""
+    Write-Host "Step 2 — Checker Model Selection:"
+    Write-Host "Note: Claude Opus 5.5 has a smaller quota pool and hits rate limits faster than Gemini Carbon. In Dual-Checker mode, if one model hits quota/rate-limit, QA automatically continues with the surviving model."
+
+    $slotA = Read-ModelChoice -SlotLabel 'Slot A (checker-rN-a)' -DefaultNum 1
+    $slotB = ''
+    if ($modeChoice -eq 'dual') {
+        while ($true) {
+            $slotB = Read-ModelChoice -SlotLabel 'Slot B (checker-rN-b)' -DefaultNum 2
+            if ($slotA -eq $slotB) {
+                Write-Warning "Slot A and Slot B are both set to '$slotA'. Using the same model reduces cross-family independence."
+                $confirm = Read-Host "Proceed with identical Slot A and Slot B models? [y/N]"
+                if ($confirm -match '^(?i)y(es)?$') {
+                    break
+                }
+                continue
+            }
+            break
+        }
+    }
+
+    return [PSCustomObject]@{
+        CheckerMode = $modeChoice
+        SlotAModel  = $slotA
+        SlotBModel  = $slotB
+    }
+}
+
+function Load-PersistedCheckerConfig {
+    param([Parameter(Mandatory = $true)][string]$TargetGeminiDir)
+    $statePath = Join-Path $TargetGeminiDir 'config\agy-installer.json'
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        Write-Warning "Legacy install detected (missing $statePath); using dual-checker defaults for verification."
+        return [PSCustomObject]@{
+            CheckerMode = 'dual'
+            SlotAModel  = $DefaultSlotA
+            SlotBModel  = $DefaultSlotB
+        }
+    }
+    try {
+        $raw = [System.IO.File]::ReadAllText($statePath, $Utf8NoBom)
+        $obj = $raw | ConvertFrom-Json
+    } catch {
+        [Console]::Error.WriteLine("Error: Failed to parse ${statePath}: $_")
+        exit 1
+    }
+    if ($null -eq $obj -or -not ($obj -is [pscustomobject])) {
+        [Console]::Error.WriteLine("Error: Invalid JSON root in ${statePath}: expected a JSON object.")
+        exit 1
+    }
+    $allowedKeys = @('checkerMode', 'slotAModel', 'slotBModel')
+    foreach ($prop in $obj.PSObject.Properties) {
+        if ($prop.Name -notin $allowedKeys) {
+            [Console]::Error.WriteLine("Error: Unknown key '$($prop.Name)' in ${statePath}.")
+            exit 1
+        }
+        if ($null -eq $prop.Value -or -not ($prop.Value -is [string])) {
+            [Console]::Error.WriteLine("Error: Invalid non-string value for '$($prop.Name)' in ${statePath}.")
+            exit 1
+        }
+    }
+    if ($null -eq $obj.PSObject.Properties['checkerMode'] -or $null -eq $obj.PSObject.Properties['slotAModel']) {
+        [Console]::Error.WriteLine("Error: Missing required key(s) in ${statePath}.")
+        exit 1
+    }
+    $m = [string]$obj.PSObject.Properties['checkerMode'].Value
+    $a = [string]$obj.PSObject.Properties['slotAModel'].Value
+    $b = if ($null -ne $obj.PSObject.Properties['slotBModel']) { [string]$obj.PSObject.Properties['slotBModel'].Value } else { '' }
+    if ($m -notin @('single', 'dual')) {
+        [Console]::Error.WriteLine("Error: Invalid checkerMode '$m' in $statePath.")
+        exit 1
+    }
+    Assert-ValidModelId -ModelId $a -Label "${statePath}:slotAModel"
+    if ($m -eq 'dual') {
+        Assert-ValidModelId -ModelId $b -Label "${statePath}:slotBModel"
+    } elseif (-not [string]::IsNullOrWhiteSpace($b)) {
+        [Console]::Error.WriteLine("Error: Invalid state in ${statePath}: slotBModel must be empty when checkerMode is single.")
+        exit 1
+    }
+    return [PSCustomObject]@{
+        CheckerMode = $m
+        SlotAModel  = $a
+        SlotBModel  = $b
     }
 }
 
@@ -105,7 +287,7 @@ function Write-FileAtomicUtf8 {
     }
     $tmpPath = "$TargetPath.tmp.$([Guid]::NewGuid().ToString('N'))"
     try {
-        [System.IO.File]::WriteAllText($tmpPath, $Content, $Utf8NoBom)
+        [System.IO.File]::WriteAllText($tmpPath, (Normalize-LF -Text $Content), $Utf8NoBom)
         Move-Item -LiteralPath $tmpPath -Destination $TargetPath -Force
     } finally {
         if (Test-Path -LiteralPath $tmpPath -PathType Leaf) {
@@ -139,9 +321,89 @@ function Get-RemoteText {
     return [string]$resp.Content
 }
 
+function Render-Templates {
+    param(
+        [Parameter(Mandatory = $true)][string]$BlockTemplate,
+        [Parameter(Mandatory = $true)][string]$SkillTemplate,
+        [Parameter(Mandatory = $true)][string]$AuditText,
+        [Parameter(Mandatory = $true)][pscustomobject]$CheckerConfig
+    )
+    $slotA = $CheckerConfig.SlotAModel
+    $slotALow = Get-LowModelId -ModelId $slotA
+    $slotB = $CheckerConfig.SlotBModel
+    $slotBLow = if (-not [string]::IsNullOrWhiteSpace($slotB)) { Get-LowModelId -ModelId $slotB } else { '' }
+
+    if ($CheckerConfig.CheckerMode -eq 'dual') {
+        $quotaClause   = '1-of-2 checker quota/rate-limit -> SINGLE_CHECKER_DEGRADED (kill rate-limited slot, stay degraded for round, cite verbatim 429/quota); 2-of-2 checkers or builder/bulk/Manager quota -> Hard Stop'
+        $partialClause = ' On partial wakeup (1/2 checkers done), do NOT analyze or dispatch `builder`; wait until both finish (or surviving slot in SINGLE_CHECKER_DEGRADED).'
+        $roleLine      = "- ``checker``: Dual-Slot read-only QA (``workspace=""inherit""``, **NO nested ``checker -> scout``**, **NO ``read_board``**): Slot A ``checker-rN-a`` (``$slotA``, ``$slotALow`` on eligible R2/R3) + Slot B ``checker-rN-b`` (``$slotB``, ``$slotBLow`` on eligible R2/R3)."
+        $meceClause    = 'fresh dual-slot `checker-rN-{a|b}` (R1 dual, R2/R3 selective row-owner; kill after verdicts; Manager never self-overrides `B/M`)'
+        $slotMapLine   = "- **Dual-Checker Slot Mapping (SSOT):** Slot A = ``checker-rN-a`` (``$slotA`` / ``$slotALow``), Slot B = ``checker-rN-b`` (``$slotB`` / ``$slotBLow``)."
+        $tierLines     = @(
+            "  - **T1** (Fast-Path, no risk paths): Skip checker (optional 1x R1 Slot A ``$slotA`` for cross-family contrast with ``builder=hydrogen``)."
+            "  - **T2** (Swarm-Path OR risk paths: ``auth``, ``deletion``, ``migrations``, ``install scripts``, ``hooks``, ``CI``, ``secrets``):"
+            "    - **R1:** Always dual ``-medium`` (``checker-r1-a`` + ``checker-r1-b``) in parallel on full pack."
+            "    - **R2 (Row-Owner Selective + Effort-Stepped):** Re-run each slot holding open ``B/M`` (``-medium`` if ``Sev=B``/``CONTEST``/``OVERFLOW``, ``-low`` if ``M``-only without ``CONTEST``); also re-run peer slot on delta if fix touches hunks outside failing anchors or T2 risk paths. If minting slot hits quota, dispatch surviving-slot ``-medium`` for those open rows on the same ``diff_sha256``."
+            "    - **R3 (Binary Closure):** Only slot(s) with open ``B/M`` (``-low``, or ``-medium`` for ``Sev=B/CONTEST``; surviving-slot ``-medium`` if minting slot hit quota)."
+            "- **F17 Plan Audit (Optional):** For ``>= 5`` files, policy changes, or destructive schema/config changes, run 1-round dual ``checker-plan-a`` + ``checker-plan-b`` (``[[AGY-ROLE:checker-plan round=1]]``) before ``builder``."
+        ) -join "`n"
+    } else {
+        $quotaClause   = 'Quota/Rate-Limit = Hard Stop (kill workers, save resume note, no auto-downgrade or retry-storms)'
+        $partialClause = ''
+        $roleLine      = "- ``checker``: Read-only QA (``workspace=""inherit""``, **NO nested ``checker -> scout``**, **NO ``read_board``**): Slot A ``checker-rN-a`` (``$slotA``, ``$slotALow`` on eligible R2/R3)."
+        $meceClause    = 'fresh `checker-rN-a` (kill after verdict; Manager never self-overrides `B/M`)'
+        $slotMapLine   = "- **Checker Slot Mapping (SSOT):** Slot A = ``checker-rN-a`` (``$slotA`` / ``$slotALow``)."
+        $tierLines     = @(
+            "  - **T1** (Fast-Path, no risk paths): Skip checker (optional 1x R1 Slot A ``$slotA``)."
+            "  - **T2** (Swarm-Path OR risk paths: ``auth``, ``deletion``, ``migrations``, ``install scripts``, ``hooks``, ``CI``, ``secrets``):"
+            "    - **R1:** Single ``-medium`` (``checker-r1-a``) on full pack."
+            "    - **R2 (Effort-Stepped):** Re-run ``checker-r2-a`` on open ``B/M`` + delta (``-medium`` if ``Sev=B``/``CONTEST``/``OVERFLOW``, ``-low`` if ``M``-only without ``CONTEST``)."
+            "    - **R3 (Binary Closure):** Re-run ``checker-r3-a`` on open ``B/M`` (``-low``, or ``-medium`` for ``Sev=B/CONTEST``)."
+            "- **F17 Plan Audit (Optional):** For ``>= 5`` files, policy changes, or destructive schema/config changes, run 1-round ``checker-plan-a`` (``[[AGY-ROLE:checker-plan round=1]]``) before ``builder``."
+        ) -join "`n"
+    }
+
+    $renderedBlock = (Normalize-LF -Text $BlockTemplate).
+        Replace('{{AGY_QUOTA_POLICY_CLAUSE}}', $quotaClause).
+        Replace('{{AGY_PARTIAL_WAKEUP_CLAUSE}}', $partialClause).
+        Replace('{{AGY_CHECKER_ROLE_LINE}}', $roleLine).
+        Replace('{{AGY_CHECKER_MECE_CLAUSE}}', $meceClause)
+
+    $renderedSkill = (Normalize-LF -Text $SkillTemplate).
+        Replace('{{AGY_SLOT_MAPPING_LINE}}', $slotMapLine).
+        Replace('{{AGY_TIER_R1_R3_LINES}}', $tierLines).
+        Replace('{{AGY_QUOTA_POLICY_CLAUSE}}', $quotaClause).
+        Replace('{{AGY_PARTIAL_WAKEUP_CLAUSE}}', $partialClause)
+
+    $renderedAudit = Normalize-LF -Text $AuditText
+
+    foreach ($item in @(
+        @{ Name = 'rules/delegation-block.md'; Text = $renderedBlock; MaxLines = 36 },
+        @{ Name = 'skills/swarm-delegation/SKILL.md'; Text = $renderedSkill; MaxLines = 115 },
+        @{ Name = 'skills/swarm-audit/SKILL.md'; Text = $renderedAudit; MaxLines = 85 }
+    )) {
+        if ($item.Text -match '\{\{[^}]+\}\}') {
+            [Console]::Error.WriteLine("Error: Unreplaced template token detected in rendered $($item.Name).")
+            exit 1
+        }
+        $lc = Get-LineCountLF -Text $item.Text
+        if ($lc -gt $item.MaxLines) {
+            [Console]::Error.WriteLine("Error: Rendered $($item.Name) exceeds line cap ($lc > $($item.MaxLines)).")
+            exit 1
+        }
+    }
+
+    return [PSCustomObject]@{
+        BlockText = $renderedBlock
+        SkillText = $renderedSkill
+        AuditText = $renderedAudit
+    }
+}
+
 function Resolve-Payloads {
     param(
         [Parameter(Mandatory = $true)][string]$GitRef,
+        [Parameter(Mandatory = $true)][pscustomobject]$CheckerConfig,
         [switch]$IncludeHooks
     )
 
@@ -214,10 +476,12 @@ function Resolve-Payloads {
         exit 1
     }
 
+    $rendered = Render-Templates -BlockTemplate $blockText -SkillTemplate $skillText -AuditText $auditText -CheckerConfig $CheckerConfig
+
     return [PSCustomObject]@{
-        BlockText          = $blockText
-        SkillText          = $skillText
-        AuditText          = $auditText
+        BlockText          = $rendered.BlockText
+        SkillText          = $rendered.SkillText
+        AuditText          = $rendered.AuditText
         HookClassifierText = $hookClassifierText
         HookDelegText      = $hookDelegText
         HookStopText       = $hookStopText
@@ -335,6 +599,7 @@ function Invoke-Uninstall {
     $backupDir    = Join-Path $TargetGeminiDir 'backups'
     $skillDstPath = Join-Path $TargetGeminiDir 'config\skills\swarm-delegation\SKILL.md'
     $auditDstPath = Join-Path $TargetGeminiDir 'config\skills\swarm-audit\SKILL.md'
+    $statePath    = Join-Path $TargetGeminiDir 'config\agy-installer.json'
 
     if (Test-Path -LiteralPath $geminiMdPath -PathType Leaf) {
         $liveText = [System.IO.File]::ReadAllText($geminiMdPath, $Utf8NoBom)
@@ -366,6 +631,7 @@ function Invoke-Uninstall {
 
     Remove-SkillFile -DstPath $skillDstPath
     Remove-SkillFile -DstPath $auditDstPath
+    Remove-SkillFile -DstPath $statePath
 
     $hooksDir     = Join-Path $TargetGeminiDir 'hooks'
     $hooksJson    = Join-Path $TargetGeminiDir 'hooks.json'
@@ -505,6 +771,7 @@ function Invoke-Install {
         [Parameter(Mandatory = $true)][string]$CanonicalBlockText,
         [Parameter(Mandatory = $true)][string]$CanonicalSkillText,
         [Parameter(Mandatory = $true)][string]$CanonicalAuditText,
+        [Parameter(Mandatory = $true)][pscustomobject]$CheckerConfig,
         [switch]$IncludeHooks,
         [pscustomobject]$Payloads = $null
     )
@@ -513,6 +780,7 @@ function Invoke-Install {
     $backupDir    = Join-Path $TargetGeminiDir 'backups'
     $skillDstPath = Join-Path $TargetGeminiDir 'config\skills\swarm-delegation\SKILL.md'
     $auditDstPath = Join-Path $TargetGeminiDir 'config\skills\swarm-audit\SKILL.md'
+    $statePath    = Join-Path $TargetGeminiDir 'config\agy-installer.json'
 
     if (-not (Test-Path -LiteralPath $TargetGeminiDir -PathType Container)) {
         New-Item -ItemType Directory -Force -Path $TargetGeminiDir | Out-Null
@@ -555,6 +823,14 @@ function Invoke-Install {
     Install-SkillFile -DstPath $skillDstPath -CanonicalText $CanonicalSkillText
     Install-SkillFile -DstPath $auditDstPath -CanonicalText $CanonicalAuditText
 
+    $stateObj = [ordered]@{
+        checkerMode = $CheckerConfig.CheckerMode
+        slotAModel  = $CheckerConfig.SlotAModel
+        slotBModel  = $CheckerConfig.SlotBModel
+    }
+    $stateJson = (Normalize-LF -Text ($stateObj | ConvertTo-Json -Depth 4)) + "`n"
+    Write-FileAtomicUtf8 -TargetPath $statePath -Content $stateJson
+
     $verifyHooks = $false
     if ($IncludeHooks -and $null -ne $Payloads) {
         if (Install-Hooks -TargetGeminiDir $TargetGeminiDir -BackupDir $backupDir -Payloads $Payloads) {
@@ -577,9 +853,22 @@ function Invoke-Install {
     }
 }
 
-if ($VerifyOnly -and $Uninstall) {
-    [Console]::Error.WriteLine('Error: -VerifyOnly and -Uninstall are mutually exclusive.')
+$activeModes = @($VerifyOnly.IsPresent, $Uninstall.IsPresent, $DryRun.IsPresent) | Where-Object { $_ }
+if (@($activeModes).Count -gt 1) {
+    [Console]::Error.WriteLine('Error: -VerifyOnly, -Uninstall, and -DryRun are mutually exclusive.')
     exit 1
+}
+
+if ($CheckerMode -eq 'single' -and -not [string]::IsNullOrWhiteSpace($SlotBModel)) {
+    [Console]::Error.WriteLine('Error: -SlotBModel cannot be used with -CheckerMode single.')
+    exit 1
+}
+
+if (-not [string]::IsNullOrWhiteSpace($SlotAModel)) {
+    Assert-ValidModelId -ModelId $SlotAModel -Label '-SlotAModel'
+}
+if (-not [string]::IsNullOrWhiteSpace($SlotBModel)) {
+    Assert-ValidModelId -ModelId $SlotBModel -Label '-SlotBModel'
 }
 
 if ($Uninstall) {
@@ -587,7 +876,60 @@ if ($Uninstall) {
     exit 0
 }
 
-$payloads = Resolve-Payloads -GitRef $Ref -IncludeHooks:$WithHooks
+$hasCheckerFlags = (-not [string]::IsNullOrWhiteSpace($CheckerMode)) -or (-not [string]::IsNullOrWhiteSpace($SlotAModel)) -or (-not [string]::IsNullOrWhiteSpace($SlotBModel))
+
+if ($VerifyOnly) {
+    if ($hasCheckerFlags) {
+        $resolvedMode = if ([string]::IsNullOrWhiteSpace($CheckerMode)) { 'dual' } else { $CheckerMode }
+        $resolvedA = if ([string]::IsNullOrWhiteSpace($SlotAModel)) { $DefaultSlotA } else { $SlotAModel }
+        $resolvedB = if ($resolvedMode -eq 'dual') {
+            if ([string]::IsNullOrWhiteSpace($SlotBModel)) { $DefaultSlotB } else { $SlotBModel }
+        } else { '' }
+        $checkerConfig = [PSCustomObject]@{
+            CheckerMode = $resolvedMode
+            SlotAModel  = $resolvedA
+            SlotBModel  = $resolvedB
+        }
+    } else {
+        $checkerConfig = Load-PersistedCheckerConfig -TargetGeminiDir $GeminiDir
+    }
+} else {
+    $isInteractive = (-not $NonInteractive) -and (-not $env:CI) -and (-not $hasCheckerFlags) -and $(try {
+        (-not [Console]::IsInputRedirected) -and [Environment]::UserInteractive -and -not (([Environment]::GetCommandLineArgs()) -match '^(?i)[-/]noni')
+    } catch { $false })
+
+    if ($isInteractive) {
+        $checkerConfig = Resolve-CheckerConfigInteractive
+    } else {
+        $resolvedMode = if ([string]::IsNullOrWhiteSpace($CheckerMode)) { 'dual' } else { $CheckerMode }
+        $resolvedA = if ([string]::IsNullOrWhiteSpace($SlotAModel)) { $DefaultSlotA } else { $SlotAModel }
+        $resolvedB = if ($resolvedMode -eq 'dual') {
+            if ([string]::IsNullOrWhiteSpace($SlotBModel)) { $DefaultSlotB } else { $SlotBModel }
+        } else { '' }
+        if ($resolvedMode -eq 'dual' -and $resolvedA -eq $resolvedB) {
+            Write-Warning "Slot A and Slot B are both set to '$resolvedA'. Proceeding in non-interactive mode."
+        }
+        $checkerConfig = [PSCustomObject]@{
+            CheckerMode = $resolvedMode
+            SlotAModel  = $resolvedA
+            SlotBModel  = $resolvedB
+        }
+    }
+}
+
+$payloads = Resolve-Payloads -GitRef $Ref -CheckerConfig $checkerConfig -IncludeHooks:$WithHooks
+
+if ($DryRun) {
+    $blockHash = Get-Sha256HexLF -Text (Extract-BlockLF -Text $payloads.BlockText)
+    $skillHash = Get-Sha256HexLF -Text $payloads.SkillText
+    $auditHash = Get-Sha256HexLF -Text $payloads.AuditText
+    Write-Host "DRY-RUN : Target=$GeminiDir"
+    Write-Host "MODE    : $($checkerConfig.CheckerMode) (SlotA=$($checkerConfig.SlotAModel), SlotB=$($checkerConfig.SlotBModel))"
+    Write-Host "SHA256  : GEMINI.md block = $blockHash ($(Get-LineCountLF -Text $payloads.BlockText)L)"
+    Write-Host "SHA256  : swarm-delegation/SKILL.md = $skillHash ($(Get-LineCountLF -Text $payloads.SkillText)L)"
+    Write-Host "SHA256  : swarm-audit/SKILL.md = $auditHash ($(Get-LineCountLF -Text $payloads.AuditText)L)"
+    exit 0
+}
 
 if ($VerifyOnly) {
     $ok = Invoke-Verify `
@@ -607,5 +949,6 @@ Invoke-Install `
     -CanonicalBlockText $payloads.BlockText `
     -CanonicalSkillText $payloads.SkillText `
     -CanonicalAuditText $payloads.AuditText `
+    -CheckerConfig $checkerConfig `
     -IncludeHooks:$WithHooks `
     -Payloads $payloads

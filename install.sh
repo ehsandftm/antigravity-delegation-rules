@@ -5,6 +5,9 @@ TMP_DIR=""
 START_MARKER="<!-- antigravity-delegation-rules:start -->"
 END_MARKER="<!-- antigravity-delegation-rules:end -->"
 REPO_SLUG="ehsandftm/antigravity-delegation-rules"
+DEFAULT_SLOT_A="claude-opus-5-5-medium"
+DEFAULT_SLOT_B="gemini-4-carbon-medium"
+MODEL_ID_REGEX='^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
 
 cleanup() {
   if [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR:-}" ]]; then
@@ -18,12 +21,17 @@ usage() {
 Usage: install.sh [OPTIONS]
 
 Options:
-  --with-hooks         Opt-in: install pure-Node PreToolUse & Stop hooks into <gemini-dir>/hooks/ and merge hooks.json
-  --verify             Verify installed GEMINI.md block and SKILL.md files (and hooks if --with-hooks) against canonical SHA-256
-  --uninstall          Remove delegation block from GEMINI.md, installed skills, and any installed agy hooks/cache
-  --gemini-dir <path>  Target Antigravity directory (default: $HOME/.gemini)
-  --ref <git-ref>      Git ref for remote raw downloads (default: main)
-  -h, --help           Show this help message
+  --checker-mode <single|dual>  Checker mode (default: dual, or interactive prompt)
+  --slot-a-model <id>           Model ID for Slot A (checker-rN-a)
+  --slot-b-model <id>           Model ID for Slot B (checker-rN-b, dual mode only)
+  --non-interactive             Skip interactive prompts and use defaults/flags
+  --dry-run                     Validate, render, and print LF SHA-256 hashes without writing files
+  --with-hooks                  Opt-in: install pure-Node PreToolUse & Stop hooks into <gemini-dir>/hooks/ and merge hooks.json
+  --verify                      Verify installed GEMINI.md block and SKILL.md files (and hooks if --with-hooks) against canonical SHA-256
+  --uninstall                   Remove delegation block from GEMINI.md, installed skills, state file, and any installed agy hooks/cache
+  --gemini-dir <path>           Target Antigravity directory (default: $HOME/.gemini)
+  --ref <git-ref>               Git ref for remote raw downloads (default: main)
+  -h, --help                    Show this help message
 EOF
 }
 
@@ -34,6 +42,251 @@ sha256_stdin_lf() {
     tr -d '\r' | shasum -a 256 | awk '{print $1}'
   else
     echo "Error: neither sha256sum nor shasum is available." >&2
+    exit 1
+  fi
+}
+
+validate_model_id() {
+  local model_id="$1"
+  local label="$2"
+  if [[ -z "$model_id" || ! "$model_id" =~ $MODEL_ID_REGEX ]]; then
+    echo "Error: Invalid model ID for ${label}: '${model_id}'. Must match ${MODEL_ID_REGEX}." >&2
+    exit 1
+  fi
+}
+
+derive_low_model() {
+  local model_id="$1"
+  if [[ "$model_id" == *-medium ]]; then
+    printf '%s-low' "${model_id%-medium}"
+  else
+    printf '%s' "$model_id"
+  fi
+}
+
+prompt_read() {
+  local prompt_text="$1"
+  local var_name="$2"
+  local val=""
+  printf '%s' "$prompt_text" >&2
+  if [[ -t 0 ]]; then
+    read -r val || val=""
+  else
+    read -r val </dev/tty || val=""
+  fi
+  printf -v "$var_name" '%s' "$val"
+}
+
+read_model_choice() {
+  local slot_label="$1"
+  local default_num="$2"
+  local out_var="$3"
+  local choice="" custom=""
+  local models=("claude-opus-5-5-medium" "gemini-4-carbon-medium" "gemini-4-argon-medium" "claude-sonnet-5-5-medium")
+
+  while true; do
+    echo "" >&2
+    echo "Select model for ${slot_label} (default [${default_num}]):" >&2
+    echo "  1) claude-opus-5-5-medium (smaller quota; best cross-family contrast)" >&2
+    echo "  2) gemini-4-carbon-medium (larger Gemini quota pool)" >&2
+    echo "  3) gemini-4-argon-medium (Gemini quota pool)" >&2
+    echo "  4) claude-sonnet-5-5-medium (Claude quota pool)" >&2
+    echo "  5) Custom model ID" >&2
+    prompt_read "Enter choice [1-5] (default ${default_num}): " choice
+    choice="${choice//[[:space:]]/}"
+    if [[ -z "$choice" ]]; then
+      printf -v "$out_var" '%s' "${models[$((default_num - 1))]}"
+      return 0
+    fi
+    case "$choice" in
+      1|2|3|4)
+        printf -v "$out_var" '%s' "${models[$((choice - 1))]}"
+        return 0
+        ;;
+      5)
+        prompt_read "Enter custom model ID: " custom
+        custom="${custom#"${custom%%[![:space:]]*}"}"
+        custom="${custom%"${custom##*[![:space:]]}"}"
+        if [[ -n "$custom" && "$custom" =~ $MODEL_ID_REGEX ]]; then
+          printf -v "$out_var" '%s' "$custom"
+          return 0
+        fi
+        echo "Invalid model ID. Must match ${MODEL_ID_REGEX}." >&2
+        ;;
+      *)
+        echo "Invalid selection '${choice}'. Please enter 1-5." >&2
+        ;;
+    esac
+  done
+}
+
+resolve_checker_config_interactive() {
+  local raw_mode="" confirm=""
+  echo "" >&2
+  echo "=== Antigravity Delegation Rules v1.3 Setup ===" >&2
+  echo "Step 1 — Checker Mode:" >&2
+  echo "  [1] Dual-Checker (Recommended)" >&2
+  echo "  [2] Single-Checker" >&2
+  while true; do
+    prompt_read "Select mode [1-2] (default 1): " raw_mode
+    raw_mode="${raw_mode//[[:space:]]/}"
+    if [[ -z "$raw_mode" || "$raw_mode" == "1" ]]; then
+      CFG_MODE="dual"
+      break
+    elif [[ "$raw_mode" == "2" ]]; then
+      CFG_MODE="single"
+      break
+    else
+      echo "Invalid selection '${raw_mode}'. Please enter 1 or 2." >&2
+    fi
+  done
+
+  echo "" >&2
+  echo "Step 2 — Checker Model Selection:" >&2
+  echo "Note: Claude Opus 5.5 has a smaller quota pool and hits rate limits faster than Gemini Carbon. In Dual-Checker mode, if one model hits quota/rate-limit, QA automatically continues with the surviving model." >&2
+
+  read_model_choice "Slot A (checker-rN-a)" 1 CFG_SLOT_A
+  CFG_SLOT_B=""
+  if [[ "$CFG_MODE" == "dual" ]]; then
+    while true; do
+      read_model_choice "Slot B (checker-rN-b)" 2 CFG_SLOT_B
+      if [[ "$CFG_SLOT_A" == "$CFG_SLOT_B" ]]; then
+        echo "WARNING : Slot A and Slot B are both set to '${CFG_SLOT_A}'. Using the same model reduces cross-family independence." >&2
+        prompt_read "Proceed with identical Slot A and Slot B models? [y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+          break
+        fi
+        continue
+      fi
+      break
+    done
+  fi
+}
+
+load_persisted_checker_config() {
+  local gemini_dir="$1"
+  local state_file="${gemini_dir}/config/agy-installer.json"
+  if [[ ! -f "$state_file" ]]; then
+    echo "WARNING : Legacy install detected (missing ${state_file}); using dual-checker defaults for verification." >&2
+    CFG_MODE="dual"
+    CFG_SLOT_A="$DEFAULT_SLOT_A"
+    CFG_SLOT_B="$DEFAULT_SLOT_B"
+    return 0
+  fi
+
+  local parsed
+  parsed="$(awk '
+    function skip_ws(str, pos,    c) {
+      while (pos <= length(str)) {
+        c = substr(str, pos, 1)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") pos++
+        else break
+      }
+      return pos
+    }
+    function parse_str(str, pos, out,    c, res, esc) {
+      if (substr(str, pos, 1) != "\"") { out[2] = 0; return }
+      pos++
+      res = ""
+      while (pos <= length(str)) {
+        c = substr(str, pos, 1)
+        if (c == "\"") {
+          out[1] = res
+          out[2] = pos + 1
+          return
+        }
+        if (c == "\\") {
+          pos++
+          if (pos > length(str)) { out[2] = 0; return }
+          esc = substr(str, pos, 1)
+          if (esc == "\"" || esc == "\\" || esc == "/") res = res esc
+          else if (esc == "b") res = res "\b"
+          else if (esc == "f") res = res "\f"
+          else if (esc == "n") res = res "\n"
+          else if (esc == "r") res = res "\r"
+          else if (esc == "t") res = res "\t"
+          else if (esc == "u") {
+            if (pos + 4 > length(str)) { out[2] = 0; return }
+            if (substr(str, pos + 1, 4) !~ /^[0-9a-fA-F]{4}$/) { out[2] = 0; return }
+            res = res "\\u" substr(str, pos + 1, 4)
+            pos += 4
+          } else { out[2] = 0; return }
+        } else if (c == "\n" || c == "\r") {
+          out[2] = 0; return
+        } else {
+          res = res c
+        }
+        pos++
+      }
+      out[2] = 0
+    }
+    BEGIN { content = "" }
+    {
+      gsub(/\r/, "", $0)
+      content = content (NR > 1 ? "\n" : "") $0
+    }
+    END {
+      if (NR == 0) { print "ERR|Empty state file."; exit }
+      pos = skip_ws(content, 1)
+      if (substr(content, pos, 1) != "{") { print "ERR|Expected JSON object."; exit }
+      pos = skip_ws(content, pos + 1)
+      if (substr(content, pos, 1) == "}") {
+        pos = skip_ws(content, pos + 1)
+        if (pos <= length(content)) { print "ERR|Trailing data after JSON object."; exit }
+        print "ERR|Missing required key(s)."
+        exit
+      }
+      while (1) {
+        parse_str(content, pos, kout)
+        if (kout[2] == 0) { print "ERR|Invalid JSON key."; exit }
+        key = kout[1]
+        pos = skip_ws(content, kout[2])
+        if (substr(content, pos, 1) != ":") { print "ERR|Expected colon after key."; exit }
+        pos = skip_ws(content, pos + 1)
+        parse_str(content, pos, vout)
+        if (vout[2] == 0) { print "ERR|Expected string value for key " key "."; exit }
+        val = vout[1]
+        if (index(val, "|") > 0 || index(val, "\n") > 0) { print "ERR|Invalid character in value for key " key "."; exit }
+        if (key != "checkerMode" && key != "slotAModel" && key != "slotBModel") {
+          print "ERR|Unknown key " key "."
+          exit
+        }
+        if (seen[key]) { print "ERR|Duplicate key " key "."; exit }
+        seen[key] = 1
+        vals[key] = val
+        pos = skip_ws(content, vout[2])
+        c = substr(content, pos, 1)
+        if (c == ",") {
+          pos = skip_ws(content, pos + 1)
+        } else if (c == "}") {
+          pos = skip_ws(content, pos + 1)
+          break
+        } else {
+          print "ERR|Expected comma or closing brace."
+          exit
+        }
+      }
+      if (pos <= length(content)) { print "ERR|Trailing data after JSON object."; exit }
+      if (!seen["checkerMode"] || !seen["slotAModel"]) { print "ERR|Missing required key(s)."; exit }
+      printf "OK|%s|%s|%s\n", vals["checkerMode"], vals["slotAModel"], (seen["slotBModel"] ? vals["slotBModel"] : "")
+    }
+  ' "$state_file")"
+
+  local parse_status
+  IFS='|' read -r parse_status CFG_MODE CFG_SLOT_A CFG_SLOT_B <<< "$parsed"
+  if [[ "$parse_status" != "OK" ]]; then
+    echo "Error: Invalid state in ${state_file}: ${CFG_MODE:-Failed to parse JSON.}" >&2
+    exit 1
+  fi
+  if [[ "$CFG_MODE" != "single" && "$CFG_MODE" != "dual" ]]; then
+    echo "Error: Invalid checkerMode '${CFG_MODE}' in ${state_file}." >&2
+    exit 1
+  fi
+  validate_model_id "$CFG_SLOT_A" "${state_file}:slotAModel"
+  if [[ "$CFG_MODE" == "dual" ]]; then
+    validate_model_id "$CFG_SLOT_B" "${state_file}:slotBModel"
+  elif [[ -n "$CFG_SLOT_B" ]]; then
+    echo "Error: Invalid state in ${state_file}: slotBModel must be empty when checkerMode is single." >&2
     exit 1
   fi
 }
@@ -158,6 +411,105 @@ validate_payloads() {
   fi
 }
 
+render_template_file() {
+  local src="$1"
+  local dst="$2"
+  awk '
+    function replace_all(str, tok, val,    pos, out) {
+      out = ""
+      while ((pos = index(str, tok)) > 0) {
+        out = out substr(str, 1, pos - 1) val
+        str = substr(str, pos + length(tok))
+      }
+      return out str
+    }
+    BEGIN { content = "" }
+    {
+      gsub(/\r/, "", $0)
+      content = content (NR > 1 ? "\n" : "") $0
+    }
+    END {
+      content = replace_all(content, "{{AGY_QUOTA_POLICY_CLAUSE}}", ENVIRON["T_QUOTA"])
+      content = replace_all(content, "{{AGY_PARTIAL_WAKEUP_CLAUSE}}", ENVIRON["T_PARTIAL"])
+      content = replace_all(content, "{{AGY_CHECKER_ROLE_LINE}}", ENVIRON["T_ROLE"])
+      content = replace_all(content, "{{AGY_CHECKER_MECE_CLAUSE}}", ENVIRON["T_MECE"])
+      content = replace_all(content, "{{AGY_SLOT_MAPPING_LINE}}", ENVIRON["T_SLOTMAP"])
+      content = replace_all(content, "{{AGY_TIER_R1_R3_LINES}}", ENVIRON["T_TIER"])
+      printf "%s\n", content
+    }
+  ' "$src" > "$dst"
+}
+
+render_payloads() {
+  if [[ -z "${TMP_DIR:-}" ]]; then
+    TMP_DIR="$(mktemp -d)"
+  fi
+
+  local slot_a="$CFG_SLOT_A"
+  local slot_a_low
+  slot_a_low="$(derive_low_model "$slot_a")"
+  local slot_b="$CFG_SLOT_B"
+  local slot_b_low=""
+  if [[ -n "$slot_b" ]]; then
+    slot_b_low="$(derive_low_model "$slot_b")"
+  fi
+
+  local t_quota t_partial t_role t_mece t_slotmap t_tier
+  if [[ "$CFG_MODE" == "dual" ]]; then
+    t_quota='1-of-2 checker quota/rate-limit -> SINGLE_CHECKER_DEGRADED (kill rate-limited slot, stay degraded for round, cite verbatim 429/quota); 2-of-2 checkers or builder/bulk/Manager quota -> Hard Stop'
+    t_partial=' On partial wakeup (1/2 checkers done), do NOT analyze or dispatch `builder`; wait until both finish (or surviving slot in SINGLE_CHECKER_DEGRADED).'
+    t_role="- \`checker\`: Dual-Slot read-only QA (\`workspace=\"inherit\"\`, **NO nested \`checker -> scout\`**, **NO \`read_board\`**): Slot A \`checker-rN-a\` (\`${slot_a}\`, \`${slot_a_low}\` on eligible R2/R3) + Slot B \`checker-rN-b\` (\`${slot_b}\`, \`${slot_b_low}\` on eligible R2/R3)."
+    t_mece='fresh dual-slot `checker-rN-{a|b}` (R1 dual, R2/R3 selective row-owner; kill after verdicts; Manager never self-overrides `B/M`)'
+    t_slotmap="- **Dual-Checker Slot Mapping (SSOT):** Slot A = \`checker-rN-a\` (\`${slot_a}\` / \`${slot_a_low}\`), Slot B = \`checker-rN-b\` (\`${slot_b}\` / \`${slot_b_low}\`)."
+    t_tier="  - **T1** (Fast-Path, no risk paths): Skip checker (optional 1x R1 Slot A \`${slot_a}\` for cross-family contrast with \`builder=hydrogen\`).
+  - **T2** (Swarm-Path OR risk paths: \`auth\`, \`deletion\`, \`migrations\`, \`install scripts\`, \`hooks\`, \`CI\`, \`secrets\`):
+    - **R1:** Always dual \`-medium\` (\`checker-r1-a\` + \`checker-r1-b\`) in parallel on full pack.
+    - **R2 (Row-Owner Selective + Effort-Stepped):** Re-run each slot holding open \`B/M\` (\`-medium\` if \`Sev=B\`/\`CONTEST\`/\`OVERFLOW\`, \`-low\` if \`M\`-only without \`CONTEST\`); also re-run peer slot on delta if fix touches hunks outside failing anchors or T2 risk paths. If minting slot hits quota, dispatch surviving-slot \`-medium\` for those open rows on the same \`diff_sha256\`.
+    - **R3 (Binary Closure):** Only slot(s) with open \`B/M\` (\`-low\`, or \`-medium\` for \`Sev=B/CONTEST\`; surviving-slot \`-medium\` if minting slot hit quota).
+- **F17 Plan Audit (Optional):** For \`>= 5\` files, policy changes, or destructive schema/config changes, run 1-round dual \`checker-plan-a\` + \`checker-plan-b\` (\`[[AGY-ROLE:checker-plan round=1]]\`) before \`builder\`."
+  else
+    t_quota='Quota/Rate-Limit = Hard Stop (kill workers, save resume note, no auto-downgrade or retry-storms)'
+    t_partial=''
+    t_role="- \`checker\`: Read-only QA (\`workspace=\"inherit\"\`, **NO nested \`checker -> scout\`**, **NO \`read_board\`**): Slot A \`checker-rN-a\` (\`${slot_a}\`, \`${slot_a_low}\` on eligible R2/R3)."
+    t_mece='fresh `checker-rN-a` (kill after verdict; Manager never self-overrides `B/M`)'
+    t_slotmap="- **Checker Slot Mapping (SSOT):** Slot A = \`checker-rN-a\` (\`${slot_a}\` / \`${slot_a_low}\`)."
+    t_tier="  - **T1** (Fast-Path, no risk paths): Skip checker (optional 1x R1 Slot A \`${slot_a}\`).
+  - **T2** (Swarm-Path OR risk paths: \`auth\`, \`deletion\`, \`migrations\`, \`install scripts\`, \`hooks\`, \`CI\`, \`secrets\`):
+    - **R1:** Single \`-medium\` (\`checker-r1-a\`) on full pack.
+    - **R2 (Effort-Stepped):** Re-run \`checker-r2-a\` on open \`B/M\` + delta (\`-medium\` if \`Sev=B\`/\`CONTEST\`/\`OVERFLOW\`, \`-low\` if \`M\`-only without \`CONTEST\`).
+    - **R3 (Binary Closure):** Re-run \`checker-r3-a\` on open \`B/M\` (\`-low\`, or \`-medium\` for \`Sev=B/CONTEST\`).
+- **F17 Plan Audit (Optional):** For \`>= 5\` files, policy changes, or destructive schema/config changes, run 1-round \`checker-plan-a\` (\`[[AGY-ROLE:checker-plan round=1]]\`) before \`builder\`."
+  fi
+
+  local r_block="${TMP_DIR}/rendered-delegation-block.md"
+  local r_skill="${TMP_DIR}/rendered-swarm-delegation.md"
+  local r_audit="${TMP_DIR}/rendered-swarm-audit.md"
+
+  T_QUOTA="$t_quota" T_PARTIAL="$t_partial" T_ROLE="$t_role" T_MECE="$t_mece" T_SLOTMAP="$t_slotmap" T_TIER="$t_tier" \
+    render_template_file "$BLOCK_SRC" "$r_block"
+  T_QUOTA="$t_quota" T_PARTIAL="$t_partial" T_ROLE="$t_role" T_MECE="$t_mece" T_SLOTMAP="$t_slotmap" T_TIER="$t_tier" \
+    render_template_file "$SKILL_SRC" "$r_skill"
+  awk '{sub(/\r$/,""); print}' "$AUDIT_SRC" > "$r_audit"
+
+  BLOCK_SRC="$r_block"
+  SKILL_SRC="$r_skill"
+  AUDIT_SRC="$r_audit"
+
+  local f max_l lc
+  for pair in "${BLOCK_SRC}:36:rules/delegation-block.md" "${SKILL_SRC}:115:skills/swarm-delegation/SKILL.md" "${AUDIT_SRC}:85:skills/swarm-audit/SKILL.md"; do
+    IFS=':' read -r f max_l label <<< "$pair"
+    if grep -Eq '\{\{[^}]+\}\}' "$f"; then
+      echo "Error: Unreplaced template token detected in rendered ${label}." >&2
+      exit 1
+    fi
+    lc="$(wc -l < "$f" | tr -d '[:space:]')"
+    if [[ "$lc" -gt "$max_l" ]]; then
+      echo "Error: Rendered ${label} exceeds line cap (${lc} > ${max_l})." >&2
+      exit 1
+    fi
+  done
+}
+
 resolve_sources() {
   local ref="$1"
   local with_hooks="${2:-0}"
@@ -199,6 +551,7 @@ resolve_sources() {
   fi
 
   validate_payloads "$BLOCK_SRC" "$SKILL_SRC" "$AUDIT_SRC"
+  render_payloads
 }
 
 verify_skill_file() {
@@ -367,6 +720,7 @@ do_install() {
   local backup_dir="${gemini_dir}/backups"
   local skill_dst="${gemini_dir}/config/skills/swarm-delegation/SKILL.md"
   local audit_dst="${gemini_dir}/config/skills/swarm-audit/SKILL.md"
+  local state_file="${gemini_dir}/config/agy-installer.json"
 
   mkdir -p "$gemini_dir"
 
@@ -419,6 +773,9 @@ do_install() {
   install_skill_file "$SKILL_SRC" "$skill_dst"
   install_skill_file "$AUDIT_SRC" "$audit_dst"
 
+  printf '{\n  "checkerMode": "%s",\n  "slotAModel": "%s",\n  "slotBModel": "%s"\n}\n' \
+    "$CFG_MODE" "$CFG_SLOT_A" "$CFG_SLOT_B" | atomic_write_from_stdin "$state_file"
+
   local verify_hooks=0
   if [[ "$with_hooks" -eq 1 ]]; then
     if install_hooks "$gemini_dir"; then
@@ -444,6 +801,7 @@ do_uninstall() {
   local backup_dir="${gemini_dir}/backups"
   local skill_dst="${gemini_dir}/config/skills/swarm-delegation/SKILL.md"
   local audit_dst="${gemini_dir}/config/skills/swarm-audit/SKILL.md"
+  local state_file="${gemini_dir}/config/agy-installer.json"
 
   if [[ -f "$gemini_md" ]]; then
     local state
@@ -485,6 +843,7 @@ do_uninstall() {
 
   remove_skill_file "$skill_dst"
   remove_skill_file "$audit_dst"
+  remove_skill_file "$state_file"
 
   local hooks_dir="${gemini_dir}/hooks"
   local hooks_json="${gemini_dir}/hooks.json"
@@ -539,6 +898,10 @@ main() {
   local gemini_dir="${HOME}/.gemini"
   local ref="main"
   local with_hooks=0
+  local arg_mode=""
+  local arg_slot_a=""
+  local arg_slot_b=""
+  local non_interactive=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -547,19 +910,58 @@ main() {
         shift
         ;;
       --verify)
-        if [[ "$mode" == "uninstall" ]]; then
-          echo "Error: --verify and --uninstall are mutually exclusive." >&2
+        if [[ "$mode" != "install" && "$mode" != "verify" ]]; then
+          echo "Error: --verify, --uninstall, and --dry-run are mutually exclusive." >&2
           exit 1
         fi
         mode="verify"
         shift
         ;;
       --uninstall)
-        if [[ "$mode" == "verify" ]]; then
-          echo "Error: --verify and --uninstall are mutually exclusive." >&2
+        if [[ "$mode" != "install" && "$mode" != "uninstall" ]]; then
+          echo "Error: --verify, --uninstall, and --dry-run are mutually exclusive." >&2
           exit 1
         fi
         mode="uninstall"
+        shift
+        ;;
+      --dry-run)
+        if [[ "$mode" != "install" && "$mode" != "dry-run" ]]; then
+          echo "Error: --verify, --uninstall, and --dry-run are mutually exclusive." >&2
+          exit 1
+        fi
+        mode="dry-run"
+        shift
+        ;;
+      --non-interactive)
+        non_interactive=1
+        shift
+        ;;
+      --checker-mode)
+        [[ $# -ge 2 ]] || { echo "Error: --checker-mode requires a value." >&2; exit 1; }
+        arg_mode="$2"
+        shift 2
+        ;;
+      --checker-mode=*)
+        arg_mode="${1#*=}"
+        shift
+        ;;
+      --slot-a-model)
+        [[ $# -ge 2 ]] || { echo "Error: --slot-a-model requires a value." >&2; exit 1; }
+        arg_slot_a="$2"
+        shift 2
+        ;;
+      --slot-a-model=*)
+        arg_slot_a="${1#*=}"
+        shift
+        ;;
+      --slot-b-model)
+        [[ $# -ge 2 ]] || { echo "Error: --slot-b-model requires a value." >&2; exit 1; }
+        arg_slot_b="$2"
+        shift 2
+        ;;
+      --slot-b-model=*)
+        arg_slot_b="${1#*=}"
         shift
         ;;
       --gemini-dir)
@@ -592,12 +994,79 @@ main() {
     esac
   done
 
+  if [[ -n "$arg_mode" && "$arg_mode" != "single" && "$arg_mode" != "dual" ]]; then
+    echo "Error: --checker-mode must be 'single' or 'dual' (got '${arg_mode}')." >&2
+    exit 1
+  fi
+  if [[ "$arg_mode" == "single" && -n "$arg_slot_b" ]]; then
+    echo "Error: --slot-b-model cannot be used with --checker-mode single." >&2
+    exit 1
+  fi
+  if [[ -n "$arg_slot_a" ]]; then
+    validate_model_id "$arg_slot_a" "--slot-a-model"
+  fi
+  if [[ -n "$arg_slot_b" ]]; then
+    validate_model_id "$arg_slot_b" "--slot-b-model"
+  fi
+
   if [[ "$mode" == "uninstall" ]]; then
     do_uninstall "$gemini_dir"
     exit 0
   fi
 
+  local has_checker_flags=0
+  if [[ -n "$arg_mode" || -n "$arg_slot_a" || -n "$arg_slot_b" ]]; then
+    has_checker_flags=1
+  fi
+
+  if [[ "$mode" == "verify" ]]; then
+    if [[ "$has_checker_flags" -eq 1 ]]; then
+      CFG_MODE="${arg_mode:-dual}"
+      CFG_SLOT_A="${arg_slot_a:-$DEFAULT_SLOT_A}"
+      if [[ "$CFG_MODE" == "dual" ]]; then
+        CFG_SLOT_B="${arg_slot_b:-$DEFAULT_SLOT_B}"
+      else
+        CFG_SLOT_B=""
+      fi
+    else
+      load_persisted_checker_config "$gemini_dir"
+    fi
+  else
+    local has_tty=0
+    if [[ -t 0 ]] || { [[ -t 1 ]] && ( : </dev/tty ) 2>/dev/null; }; then
+      has_tty=1
+    fi
+    if [[ "$non_interactive" -eq 0 && -z "${CI:-}" && "$has_checker_flags" -eq 0 && "$has_tty" -eq 1 ]]; then
+      resolve_checker_config_interactive
+    else
+      CFG_MODE="${arg_mode:-dual}"
+      CFG_SLOT_A="${arg_slot_a:-$DEFAULT_SLOT_A}"
+      if [[ "$CFG_MODE" == "dual" ]]; then
+        CFG_SLOT_B="${arg_slot_b:-$DEFAULT_SLOT_B}"
+        if [[ "$CFG_SLOT_A" == "$CFG_SLOT_B" ]]; then
+          echo "WARNING : Slot A and Slot B are both set to '${CFG_SLOT_A}'. Proceeding in non-interactive mode." >&2
+        fi
+      else
+        CFG_SLOT_B=""
+      fi
+    fi
+  fi
+
   resolve_sources "$ref" "$with_hooks"
+
+  if [[ "$mode" == "dry-run" ]]; then
+    local block_hash skill_hash audit_hash
+    block_hash="$(extract_block_lf "$BLOCK_SRC" | sha256_stdin_lf)"
+    skill_hash="$(sha256_stdin_lf < "$SKILL_SRC")"
+    audit_hash="$(sha256_stdin_lf < "$AUDIT_SRC")"
+    echo "DRY-RUN : Target=${gemini_dir}"
+    echo "MODE    : ${CFG_MODE} (SlotA=${CFG_SLOT_A}, SlotB=${CFG_SLOT_B})"
+    echo "SHA256  : GEMINI.md block = ${block_hash} ($(wc -l < "$BLOCK_SRC" | tr -d '[:space:]')L)"
+    echo "SHA256  : swarm-delegation/SKILL.md = ${skill_hash} ($(wc -l < "$SKILL_SRC" | tr -d '[:space:]')L)"
+    echo "SHA256  : swarm-audit/SKILL.md = ${audit_hash} ($(wc -l < "$AUDIT_SRC" | tr -d '[:space:]')L)"
+    exit 0
+  fi
+
   if [[ "$mode" == "verify" ]]; then
     do_verify \
       "${gemini_dir}/GEMINI.md" \
